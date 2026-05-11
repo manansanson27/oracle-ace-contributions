@@ -1,0 +1,86 @@
+How to Call Any Oracle BIP Report via Postman (SOAP runReport)
+
+What You Will Learn
+By the end of this guide you will be able to:
+
+✅ Call any Oracle BIP report programmatically using Postman
+✅ Pass parameters to filter report output (by name, date range, or multiple values)
+✅ Decode the Base64 response to read the actual report data
+✅ Understand how this SOAP call fits into a larger OIC integration flow
+
+Background — What is the BIP SOAP API?
+Oracle BI Publisher exposes all reports through a single SOAP web service endpoint:
+POST /xmlpserver/services/ExternalReportWSSService
+You call it by sending a SOAP XML envelope that tells BIP:
+
+Which report to run (the catalog path)
+Which parameters to pass (optional filters)
+How much data to return at once (chunk size)
+
+BIP runs the report's SQL, renders the output, and returns it as Base64-encoded data inside the SOAP response.
+This is the same mechanism that Oracle Integration Cloud (OIC) uses under the hood when you configure a SOAP Adapter connection to BIP.
+
+Find Your BIP Report Path
+Before you can call a report, you need its catalog path. Here's how to find it:
+Option A — From the BIP Catalog UI:
+
+Log into Oracle Fusion → navigate to Tools → Reports and Analytics
+Find your report → right-click → Properties
+The path shown is your reportAbsolutePath
+
+Find Your Report Parameter Names
+If your report has parameters, you need the exact parameter names as defined in BIP.
+
+In BIP → open your report → click Edit
+Go to the Data Model (left panel) → click Parameters
+The Name column shows the identifiers to use in the SOAP call
+
+Reading the Response
+After sending the request, Postman shows the raw SOAP response. It looks like this:
+xml<soap:Envelope ...>
+  <soap:Body>
+    <ns0:runReportResponse ...>
+      <ns0:runReportReturn>
+        <ns0:reportBytes>
+          77u/PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiP...
+        </ns0:reportBytes>
+        <ns0:reportContentType>text/xml</ns0:reportContentType>
+        <ns0:reportFileID/>
+        <ns0:totalNumberOfPages>0</ns0:totalNumberOfPages>
+      </ns0:runReportReturn>
+    </ns0:runReportResponse>
+  </soap:Body>
+</soap:Envelope>
+The long string inside <ns0:reportBytes> is your report data — Base64 encoded.
+
+Decoding the Response
+Quick test in Postman:
+
+Copy the reportBytes value
+Go to base64decode.org and paste it
+You will see the raw XML data rows from your report
+
+How the SOAP Structure Works
+Every BIP SOAP call follows this structure — nothing changes except what is inside <pub:reportRequest>:
+
+<soapenv:Envelope>                   ← Required wrapper — never changes
+  <soapenv:Header/>                  ← Empty header — required but always empty
+  <soapenv:Body>                     ← Body container
+    <pub:runReport>                  ← The operation name — always "runReport"
+      <pub:reportRequest>
+        <pub:reportAbsolutePath>     ← ✏️ YOUR REPORT PATH
+        <pub:sizeOfDataChunkDownload>← -1 for full response
+        <pub:parameterNameValues>    ← ✏️ YOUR PARAMETERS
+      </pub:reportRequest>
+    </pub:runReport>
+  </soapenv:Body>
+</soapenv:Envelope>
+
+
+What I Learned
+
+The BIP SOAP endpoint is universal — the same URL and SOAP structure works for every report in the catalog. Only the path and parameters change, which makes this a reusable template across all integrations
+Parameter names are case-sensitive and must exactly match what is defined in the BIP Data Model — a common source of hard-to-debug errors
+The sizeOfDataChunkDownload = -1 setting is fine for development but for production reports with thousands of rows you should use chunked pagination to avoid timeout and memory issues
+reportBytes is always Base64 regardless of report output type — BIP encodes the entire output (XML, CSV, PDF) the same way
+Testing BIP reports in Postman before building the OIC flow saves significant time — you can verify the report path, confirm parameter names, and inspect the decoded XML structure before writing a single line of mapping logic
