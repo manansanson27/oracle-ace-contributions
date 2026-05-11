@@ -1,0 +1,193 @@
+Medical Spending Account (FSA) & Dependent Care (DCA) Payroll Results
+
+Organizations that offer Flexible Spending Accounts (FSA) and Dependent Care Accounts (DCA) must regularly extract employee deduction amounts from Oracle Fusion Payroll to:
+Reconcile contributions with their FSA/DCA third-party administrator (TPA)
+Generate funding files submitted to the benefits provider on each pay date
+Audit that payroll processed the correct deduction amounts per employee per period
+
+Flexible Spending Account (FSA)
+Dependent Care Account (DCA)
+
+Person / Employee
+    └── Element Entry (pee)          ← benefit deduction enrolled
+        └── Element Type (petf/pett) ← identifies FSA or DCA element
+            └── Payroll Action (ppa) ← the payroll run event
+                └── Time Period (ptpf) ← pay period with pay date
+                    └── Rel Action (ppra) ← employee's run action
+                        └── Run Result (prr) ← result for that element
+                            └── Run Result Value (prrv) ← the $ amount
+                                └── Input Value (pivf) ← value definition
+
+The query retrieves employee details, payroll deduction amounts, and payroll check dates for a specific payroll period.
+
+ParameterTypeRequiredDescription:P_PAYROLL_DATEVARCHAR2 (YYYY-MM-DD)YesThe pay date to extract results for. Must match ptpf.default_paydate exactly. Example: '2025-01-31'
+
+Business Requirement
+
+Organizations often need payroll deduction data for:
+
+Benefits vendors
+Third-party administrators
+Compliance reporting
+Payroll reconciliation
+Employee contribution exports
+
+This query helps generate deduction extracts directly from Fusion Payroll run results.
+
+Example Use Cases:
+Benefits deduction export files
+Payroll vendor integrations
+FSA/DCA reconciliation reports
+Employee deduction auditing
+Payroll validation processes
+
+
+-- ============================================================
+-- Script: Fusion Payroll – FSA & DCA Employee Deduction Results
+-- Author: Manan Sanson
+-- Target: Oracle Fusion HCM Payroll Cloud
+-- ============================================================
+-- Description:
+--   Extracts payroll run result values for two specific benefit
+--   deduction elements:
+--     -MEDICAL SPENDING ACCOUNT Results  → reported as 'FSA'
+--     -DEPENDENT CARE Results            → reported as 'DCA'
+--
+--   Output is intended for downstream FSA/DCA third-party file
+--   generation or reconciliation reporting. Each row represents
+--   one employee's deduction result for the specified pay date.
+--
+--   Employee contribution (eePay) is sourced from the payroll
+--   run result values. Employer contribution (erPay) is hardcoded
+--   to '0' as these are 100% employee-funded benefit deductions.
+--
+-- Parameter:
+--   :P_PAYROLL_DATE  VARCHAR2  Required. Pay date in YYYY-MM-DD format.
+--                              Matches ptpf.default_paydate exactly.
+-- ============================================================
+
+SELECT
+    ppnf.first_name                                     AS nameF,
+    ppnf.last_name                                      AS nameL,
+    papf.person_number                                  AS ID,
+
+    -- Map internal element names to short benefit account type codes
+    -- for use in downstream file generation or reporting.
+    -- Any element outside these two returns NULL (should not occur
+    -- given the WHERE filter, but defensive coding is good practice).
+    CASE
+        WHEN pett.element_name = 'MEDICAL SPENDING ACCOUNT Results'
+            THEN 'FSA'
+        WHEN pett.element_name = 'DEPENDENT CARE Results'
+            THEN 'DCA'
+        ELSE NULL
+    END                                                 AS accttype,
+
+    prrv.result_value                                   AS eePay,
+
+    -- Employer contribution is always zero for these benefit types.
+    -- Hardcoded as a string to match expected output file format.
+    '0'                                                 AS erPay,
+
+    TO_CHAR(ptpf.default_paydate, 'MM/DD/YYYY')        AS ckDT
+
+FROM
+    per_all_people_f            papf,
+    per_person_names_f          ppnf,
+    pay_element_entries_f       pee,
+    pay_element_types_f         petf,
+    pay_element_types_tl        pett,
+    pay_payroll_rel_actions     ppra,
+    pay_payroll_actions         ppa,
+    pay_time_periods            ptpf,
+    pay_run_results             prr,
+    pay_run_result_values       prrv,
+    pay_input_values_f          pivf
+
+WHERE
+    -- -------------------------------------------------------
+    -- Person and name joins
+    -- Using GLOBAL name type to get the canonical full name
+    -- regardless of local name variations.
+    -- Date-effective joins use TRUNC(SYSDATE) to get the
+    -- current active record — appropriate for a payroll extract
+    -- where we want the employee's name as it stands today.
+    -- -------------------------------------------------------
+    papf.person_id                  = ppnf.person_id
+    AND ppnf.name_type              = 'GLOBAL'
+    AND TRUNC(SYSDATE)              BETWEEN ppnf.effective_start_date
+                                        AND ppnf.effective_end_date
+    AND TRUNC(SYSDATE)              BETWEEN papf.effective_start_date
+                                        AND papf.effective_end_date
+
+    -- -------------------------------------------------------
+    -- Element entry and type joins
+    -- Linking element entries on the person to the element type
+    -- definition, then to the TL table for the element name.
+    -- Language filter ensures we get the correct locale name.
+    -- -------------------------------------------------------
+    AND pee.person_id               = papf.person_id
+    AND petf.element_type_id        = pee.element_type_id
+    AND pett.element_type_id        = petf.element_type_id
+    AND pett.language               = USERENV('LANG')
+    -- Scope to FSA and DCA benefit result elements only
+    AND pett.element_name           IN (
+            'BCB406 - MEDICAL SPENDING ACCOUNT Results',
+            'BCB407 - DEPENDENT CARE Results'
+        )
+
+    -- -------------------------------------------------------
+    -- Payroll action and period joins
+    -- Connects the payroll run action → payroll action header
+    -- → time period to resolve the pay date and cut-off date.
+    -- cut_off_date IS NOT NULL ensures we only pick up finalized
+    -- (closed) pay periods, excluding in-progress periods.
+    -- -------------------------------------------------------
+    AND ppra.payroll_action_id      = ppa.payroll_action_id
+    AND ptpf.payroll_id             = ppa.payroll_id
+    AND ppa.earn_time_period_id     = ptpf.time_period_id
+    AND ptpf.cut_off_date           IS NOT NULL
+
+    -- -------------------------------------------------------
+    -- Run result joins
+    -- Connects the payroll relationship action to its run results,
+    -- then to the specific result values and input value definition.
+    -- pivf join ensures we only pull result values that correspond
+    -- to a valid, defined input value — avoids orphaned value rows.
+    -- -------------------------------------------------------
+    AND ppra.payroll_rel_action_id  = prr.payroll_rel_action_id
+    AND prr.run_result_id           = prrv.run_result_id
+    AND prrv.input_value_id         = pivf.input_value_id
+    AND prr.element_type_id         = petf.element_type_id
+
+    -- -------------------------------------------------------
+    -- Pay date filter — the primary execution parameter.
+    -- Matches the default pay date of the time period exactly.
+    -- Format: YYYY-MM-DD  e.g. '2025-01-31'
+    -- -------------------------------------------------------
+    AND ptpf.default_paydate        = TO_DATE(:P_PAYROLL_DATE, 'YYYY-MM-DD');
+
+
+Sample Output
+First Name	Last Name	Employee ID	Account Type	Employee Pay	Check Date
+John	Smith	100245	FSA	125.00	05/15/2026
+Maria	Lopez	100678	DCA	200.00	05/15/2026
+
+Conclusion
+
+This query demonstrates how to retrieve payroll deduction results from Oracle Fusion Payroll using:
+
+Payroll run results
+Payroll processing actions
+Element result values
+Date-effective employee records
+
+It can serve as a reusable foundation for payroll integrations, benefit exports, and reconciliation reporting solutions.
+
+What I Learned
+
+The Oracle Fusion Payroll results chain (ppa → ppra → prr → prrv) must be traversed in full — there is no shortcut table that flattens run results for reporting
+PAY_ELEMENT_ENTRIES_F stores what an employee is enrolled for; PAY_RUN_RESULT_VALUES stores what was actually calculated and processed — these can differ and should never be confused
+The cut_off_date IS NOT NULL filter on PAY_TIME_PERIODS is a critical guard against pulling in-progress payroll data — missing it is a common bug in Fusion Payroll reports
+BCB element prefixes in Fusion Benefits indicate Benefits Calculation Base elements — understanding the naming convention helps quickly identify element purpose and behavior
+For third-party benefits files, it is cleaner to apply the FSA/DCA code mapping in SQL (CASE expression) rather than in the RTF template — it keeps business logic in one versioned, testable place
