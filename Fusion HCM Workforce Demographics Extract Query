@@ -1,0 +1,424 @@
+Business Problem
+Learning Management Systems (LMS) require a regular feed of employee demographic and organizational data to:
+
+Provision and update user accounts automatically
+Assign training curricula based on department, job code, or business unit
+Deactivate or terminate LMS accounts when employees become inactive
+Maintain accurate org hierarchy for manager-based assignment routing
+
+Oracle Fusion HCM stores this data across a dozen date-effective tables spanning HR Core, Payroll, Fast Formula, and Reference Data. This query consolidates all required LMS fields into a single flat extract row per employee, ready for EIB delivery.
+
+Main row: person + primary assignment + job (SET ID scoped to BU)
+    │
+    ├── InstitutionID     ← Fast Formula UDT lookup on legal employer
+    ├── Department Code   ← Conditional on active/inactive status
+    ├── Department Title  ← String parse on department name
+    ├── Hire Date         ← MAX period of service start date
+    ├── Status            ← Mapped to LMS A/I codes
+    ├── Job Code          ← Conditional on active/inactive status
+    ├── Job Title         ← String parse on job name
+    ├── Custom Field 1    ← Secondary assignment department
+    ├── Custom Field 2    ← Secondary assignment job title (regex cleaned)
+    ├── Email             ← Work email type W1
+    ├── Date of Birth     ← per_persons
+    ├── Gender            ← Legislative data
+    ├── Supervisor        ← Assignment supervisors table
+    ├── FTE               ← Work measures (formatted)
+    ├── NPI               ← National identifier (see security note)
+    └── Inactive Reason   ← Status mapped to LMS T code
+
+This query generates a workforce demographics extract containing:
+
+Employee identity information
+Employment status
+Department details
+Job details
+Supervisor relationships
+Work email
+FTE information
+Hire dates
+
+Functional Area	Purpose
+Employee Master Data	Person and assignment information
+Organization Structure	Departments and business units
+Job Information	Job codes and titles
+Employment Status	Active/inactive workforce status
+Supervisory Hierarchy	Manager relationships
+Workforce Measures	FTE calculations
+Contact Information	Work email extraction
+
+-- ============================================================
+-- Script: Fusion HCM – LMS Demographics Outbound Extract
+--         (EIB / HealthStream Integration)
+-- Author: [Your Name]
+-- Date:   YYYY-MM-DD (must be after ACE Apprentice acceptance)
+-- Target: Oracle Fusion HCM Cloud
+-- ============================================================
+-- Description:
+--   Extracts employee demographic and assignment data formatted
+--   for outbound delivery to a Learning Management System (LMS)
+--   via Oracle HCM Extracts / EIB (External Integration Bus).
+--
+--   Key features:
+--     - Resolves Institution ID via a Fast Formula User-Defined
+--       Table (UDT) keyed on legal employer name
+--     - Derives Department Code and Job Code conditionally based
+--       on assignment active/inactive status
+--     - Includes primary and secondary assignment details
+--     - Surfaces FTE, supervisor, work email, hire date, gender,
+--       and date of birth for LMS user provisioning
+--     - Maps assignment statuses to LMS-specific codes (A/I/T)
+--
+-- Parameter:
+--   :P_BUSINESS_UNIT  VARCHAR2  Required. Business Unit name to scope the extract.
+-- ============================================================
+
+SELECT
+    -- -------------------------------------------------------
+    -- Institution ID
+    -- Resolved from a User-Defined Table (UDT) that maps
+    -- legal employer names to their LMS institution codes.
+    -- Uses the most recent period of service to find the
+    -- current legal employer, then looks up the abbreviation.
+    -- -------------------------------------------------------
+    (
+        SELECT v.value
+        FROM   ff_user_tables              t,
+               ff_user_rows_f              r,
+               ff_user_columns             c,
+               ff_user_columns_tl          c_tl,
+               ff_user_column_instances_f  v,
+               per_legal_employers         ple,
+               per_periods_of_service      ppos
+        WHERE  t.user_table_id          = r.user_table_id
+        AND    t.user_table_id          = c.user_table_id
+        AND    c.user_column_id         = c_tl.user_column_id
+        AND    c.user_column_id         = v.user_column_id
+        AND    r.user_row_id            = v.user_row_id
+        AND    t.base_user_table_name   = '[YOUR_UDT_TABLE_NAME]'      -- Replace with your UDT name
+        AND    c_tl.user_column_name    = '[YOUR_UDT_COLUMN_NAME]'     -- Replace with your UDT column
+        AND    UPPER(ple.name)          = r.row_low_range_or_name
+        AND    ppos.legal_entity_id     = ple.organization_id
+        AND    papf.person_id           = ppos.person_id
+        AND    ppos.period_of_service_id = (
+                   SELECT MAX(ppos2.period_of_service_id)
+                   FROM   per_periods_of_service ppos2
+                   WHERE  ppos2.person_id = papf.person_id
+               )
+    )                                                       AS "InstitutionID",
+
+    ppnf.last_name                                          AS "Last Name",
+    ppnf.first_name                                         AS "First Name",
+    ppnf.middle_names                                       AS "Middle Name",
+
+    -- User ID derived from person number.
+    -- SUBSTR(x, 3) removes an org-specific prefix from the number.
+    -- Adjust the offset to match your person number format.
+    SUBSTR(papf.person_number, 3)                           AS "User ID",
+
+    -- -------------------------------------------------------
+    -- Department Code
+    -- When the assignment is ACTIVE: extract the numeric prefix
+    -- of the department name (characters before the first space).
+    -- When INACTIVE: return a sentinel value recognised by the
+    -- LMS as "no department" — adjust to your LMS requirement.
+    -- -------------------------------------------------------
+    CASE
+        WHEN (
+            SELECT pastv.per_system_status
+            FROM   per_assignment_status_types_vl pastv
+            WHERE  paam.assignment_status_type_id = pastv.assignment_status_type_id
+        ) <> 'ACTIVE'
+        THEN '99.9999'                                      -- LMS inactive-department sentinel; adjust as needed
+        ELSE (
+            SELECT SUBSTR(pd.name, 1, INSTR(pd.name, ' ') - 1)
+            FROM   per_departments pd
+            WHERE  TRUNC(SYSDATE) BETWEEN pd.effective_start_date AND pd.effective_end_date
+            AND    pd.organization_id = paam.organization_id
+        )
+    END                                                     AS "Department Code",
+
+    -- Department Title: text after the second space in the dept name
+    -- Assumes format: "CODE SUBCODE Department Title"
+    (
+        SELECT SUBSTR(pd.name, INSTR(pd.name, ' ', INSTR(pd.name, ' ') + 1) + 1)
+        FROM   per_departments pd
+        WHERE  TRUNC(SYSDATE) BETWEEN pd.effective_start_date AND pd.effective_end_date
+        AND    pd.organization_id = paam.organization_id
+    )                                                       AS "Department Title",
+
+    -- Most recent hire date across all periods of service
+    (
+        SELECT TO_CHAR(MAX(ppos.date_start), 'YYYYMMDD')
+        FROM   per_periods_of_service ppos
+        WHERE  ppos.person_id = papf.person_id
+    )                                                       AS "Hire Date",
+
+    -- -------------------------------------------------------
+    -- Status: mapped to LMS codes A (Active) / I (Inactive)
+    -- -------------------------------------------------------
+    (
+        SELECT CASE
+                   WHEN pastv.per_system_status = 'ACTIVE'   THEN 'A'
+                   WHEN pastv.per_system_status = 'INACTIVE' THEN 'I'
+                   ELSE pastv.per_system_status
+               END
+        FROM   per_assignment_status_types_vl pastv
+        WHERE  paam.assignment_status_type_id = pastv.assignment_status_type_id
+    )                                                       AS "Status",
+
+    -- -------------------------------------------------------
+    -- Job Code
+    -- When INACTIVE: return zero-padded sentinel for LMS.
+    -- When ACTIVE:   return the job code from the job definition.
+    -- -------------------------------------------------------
+    CASE
+        WHEN (
+            SELECT pastv.per_system_status
+            FROM   per_assignment_status_types_vl pastv
+            WHERE  paam.assignment_status_type_id = pastv.assignment_status_type_id
+        ) <> 'ACTIVE'
+        THEN '00000'                                        -- LMS inactive-job sentinel; adjust as needed
+        ELSE (
+            SELECT pjfv.job_code
+            FROM   per_jobs_f_vl pjfv
+            WHERE  paam.job_id = pjfv.job_id
+            AND    TRUNC(SYSDATE) BETWEEN pjfv.effective_start_date AND pjfv.effective_end_date
+        )
+    END                                                     AS "Job Code",
+
+    -- Job Title: text after the first " - " separator in the job name
+    -- Assumes job name format: "CODE - Job Title Description"
+    (
+        SELECT SUBSTR(pjfv.name, INSTR(pjfv.name, '-') + 2)
+        FROM   per_jobs_f_vl pjfv
+        WHERE  paam.job_id = pjfv.job_id
+        AND    TRUNC(SYSDATE) BETWEEN pjfv.effective_start_date AND pjfv.effective_end_date
+    )                                                       AS "Job Title",
+
+    -- -------------------------------------------------------
+    -- Custom Field 1: Secondary assignment department name
+    -- Returns the organization name for the most recent active
+    -- non-primary assignment (e.g. dual role or secondary position)
+    -- -------------------------------------------------------
+    (
+        SELECT hou.name
+        FROM   per_all_assignments_m          paam1,
+               hr_organization_units_f_tl    hou
+        WHERE  paam1.person_id              = papf.person_id
+        AND    paam1.effective_latest_change = 'Y'
+        AND    paam1.primary_flag           != 'Y'
+        AND    TRUNC(SYSDATE) BETWEEN paam1.effective_start_date AND paam1.effective_end_date
+        AND    TRUNC(SYSDATE) BETWEEN hou.effective_start_date   AND hou.effective_end_date
+        AND    paam1.organization_id        = hou.organization_id
+        AND    hou.language                 = USERENV('LANG')
+        AND    paam1.assignment_status_type = 'ACTIVE'
+        ORDER BY paam1.effective_start_date DESC
+        FETCH FIRST 1 ROW ONLY
+    )                                                       AS "Custom Field 1",
+
+    -- -------------------------------------------------------
+    -- Custom Field 2: Secondary assignment job title
+    -- Reformats job name from "CODE.SUB - Title" to "CODE.SUB Title"
+    -- using REGEXP_REPLACE to strip the separator for LMS display.
+    -- -------------------------------------------------------
+    (
+        SELECT REGEXP_REPLACE(
+                   pjt.name,
+                   '^([0-9.]+)[[:space:]]*-[[:space:]]*(.*)$',
+                   '\1 \2'
+               )
+        FROM   per_all_assignments_m  paam1,
+               per_jobs_f             pj,
+               per_jobs_f_tl          pjt
+        WHERE  pj.job_id              = pjt.job_id
+        AND    paam1.person_id        = papf.person_id
+        AND    paam1.effective_latest_change = 'Y'
+        AND    paam1.primary_flag    != 'Y'
+        AND    TRUNC(SYSDATE) BETWEEN paam1.effective_start_date AND paam1.effective_end_date
+        AND    TRUNC(SYSDATE) BETWEEN pj.effective_start_date    AND pj.effective_end_date
+        AND    TRUNC(SYSDATE) BETWEEN pjt.effective_start_date   AND pjt.effective_end_date
+        AND    paam1.job_id           = pj.job_id
+        AND    paam1.assignment_status_type = 'ACTIVE'
+        AND    pjt.language           = USERENV('LANG')
+        ORDER BY paam1.effective_start_date DESC
+        FETCH FIRST 1 ROW ONLY
+    )                                                       AS "Custom Field 2",
+
+    NULL                                                    AS "Custom Field 3",
+    NULL                                                    AS "Custom Field 4",
+
+    -- Work email address (type W1 = primary work email)
+    (
+        SELECT pea.email_address
+        FROM   per_email_addresses pea
+        WHERE  papf.person_id = pea.person_id
+        AND    pea.email_type = 'W1'
+    )                                                       AS "User E-mail address",
+
+    -- Fields required by LMS file spec but sourced externally or not applicable
+    NULL                                                    AS "Unique Check ID",
+    NULL                                                    AS "Review Date",
+    NULL                                                    AS "Time Zone",
+
+    -- Date of birth for LMS user record
+    (
+        SELECT TO_CHAR(pp.date_of_birth, 'YYYYMMDD')
+        FROM   per_persons pp
+        WHERE  pp.person_id = papf.person_id
+    )                                                       AS "Date of Birth",
+
+    -- Gender from legislative data (country-specific)
+    (
+        SELECT pplf.sex
+        FROM   per_people_legislative_f pplf
+        WHERE  papf.person_id = pplf.person_id
+        AND    TRUNC(SYSDATE) BETWEEN pplf.effective_start_date AND pplf.effective_end_date
+    )                                                       AS "Gender",
+
+    NULL                                                    AS "Years of Experience",
+
+    -- -------------------------------------------------------
+    -- Supervisor: returns manager's person number
+    -- Resolved via per_assignment_supervisors_f which links
+    -- an assignment to its line manager.
+    -- -------------------------------------------------------
+    (
+        SELECT papf_s.person_number
+        FROM   per_assignment_supervisors_f  pasf,
+               per_all_people_f              papf_s
+        WHERE  pasf.person_id    = papf.person_id
+        AND    pasf.assignment_id = paam.assignment_id
+        AND    pasf.manager_id   = papf_s.person_id
+        AND    TRUNC(SYSDATE) BETWEEN pasf.effective_start_date   AND pasf.effective_end_date
+        AND    TRUNC(SYSDATE) BETWEEN papf_s.effective_start_date AND papf_s.effective_end_date
+    )                                                       AS "Supervisor",
+
+    TO_CHAR(paam.effective_start_date, 'YYYYMMDD')         AS "Active Date",
+    NULL                                                    AS "Inactive All Accounts",
+
+    -- FTE value from work measures, formatted to 5 decimal places
+    (
+        SELECT TO_CHAR(pawmf.value, 'FM9990.00000')
+        FROM   per_assign_work_measures_f pawmf
+        WHERE  pawmf.assignment_id = paam.assignment_id
+        AND    TRUNC(SYSDATE) BETWEEN pawmf.effective_start_date AND pawmf.effective_end_date
+        AND    pawmf.unit = 'FTE'
+    )                                                       AS "FTE",
+
+    -- -------------------------------------------------------
+    -- NPI field: populated from national identifier record.
+    -- NOTE: This field is mapped to SSN in the source system.
+    -- Mask or remove this column if the downstream LMS does
+    -- not require it, or replace with a non-sensitive identifier.
+    -- Hyphens are stripped to match LMS expected format.
+    -- -------------------------------------------------------
+    (
+        SELECT REPLACE(pni.national_identifier_number, '-', '')
+        FROM   per_national_identifiers pni
+        WHERE  papf.person_id            = pni.person_id
+        AND    pni.national_identifier_type = 'SSN'        -- Confirm with security team before enabling
+    )                                                       AS "NPI",
+
+    -- -------------------------------------------------------
+    -- Inactive Reason: maps specific inactive user statuses
+    -- to the LMS termination code 'T'.
+    -- Status names below are examples — verify against your
+    -- Fusion instance's configured assignment status labels.
+    -- -------------------------------------------------------
+    (
+        SELECT CASE
+                   WHEN pastv2.user_status IN (
+                       'Inactive - Payroll Eligible',
+                       'Inactive - No Payroll',
+                       'Suspended - No Payroll',
+                       'Suspended - Payroll Eligible'
+                   ) THEN 'T'
+                   ELSE ''
+               END
+        FROM   per_assignment_status_types_vl pastv2
+        WHERE  pastv2.assignment_status_type_id = paam.assignment_status_type_id
+    )                                                       AS "Inactive Reason",
+
+    NULL                                                    AS "Inactive Start Date",
+    NULL                                                    AS "Inactive End Date",
+    NULL                                                    AS "Term Code"
+
+FROM
+    per_all_people_f            papf,
+    per_person_names_f          ppnf,
+    per_all_assignments_m       paam,
+    per_jobs_f_vl               pjfv,
+    fnd_setid_assignments       fsa,
+    fun_all_business_units_v    bu,
+    fnd_setid_sets_vl           fs
+
+WHERE
+    -- -------------------------------------------------------
+    -- Core person and assignment joins (date-effective)
+    -- -------------------------------------------------------
+    papf.person_id              = ppnf.person_id
+    AND papf.person_id          = paam.person_id
+    AND TRUNC(SYSDATE)          BETWEEN papf.effective_start_date AND papf.effective_end_date
+    AND TRUNC(SYSDATE)          BETWEEN ppnf.effective_start_date AND ppnf.effective_end_date
+    AND TRUNC(SYSDATE)          BETWEEN paam.effective_start_date AND paam.effective_end_date
+    AND ppnf.name_type          = 'GLOBAL'
+    AND paam.assignment_type    = 'E'       -- Employee assignments only
+    AND paam.primary_flag       = 'Y'       -- Primary assignment only
+
+    -- -------------------------------------------------------
+    -- Job set resolution via Business Unit → Set ID
+    -- Ensures job codes are resolved from the correct reference
+    -- data set assigned to the specified Business Unit.
+    -- -------------------------------------------------------
+    AND paam.job_id             = pjfv.job_id (+)
+    AND TRUNC(SYSDATE)          BETWEEN pjfv.effective_start_date AND pjfv.effective_end_date
+    AND pjfv.set_id             = fs.set_id
+    AND fsa.determinant_type    = 'BU'
+    AND fsa.determinant_value   = bu.bu_id
+    AND fsa.set_id              = fs.set_id
+    AND fsa.reference_group_name = 'PER_JOBS'
+    AND bu.bu_name              = :P_BUSINESS_UNIT
+
+    -- -------------------------------------------------------
+    -- Latest assignment record per person
+    -- Correlated subquery ensures we pick the most recent
+    -- effective assignment row, avoiding duplicates when
+    -- multiple history rows fall within the current date range.
+    -- -------------------------------------------------------
+    AND paam.effective_start_date = (
+            SELECT MAX(paam2.effective_start_date)
+            FROM   per_all_assignments_m paam2
+            WHERE  paam2.person_id       = papf.person_id
+            AND    paam2.primary_flag    = 'Y'
+            AND    paam2.assignment_type = 'E'
+            AND    TRUNC(SYSDATE) BETWEEN paam2.effective_start_date AND paam2.effective_end_date
+        );
+
+
+Integration Use Cases
+
+This query can support:
+
+LMS user provisioning
+Employee synchronization
+Workforce demographic exports
+Compliance training systems
+Identity management integrations
+
+Recommended Optimizations
+Avoid repeated scalar subqueries where possible
+Replace repeated status lookups with joins
+Ensure effective-date filters are indexed
+Use bind variables for business unit filtering
+
+Conclusion
+
+This query is a practical enterprise-grade example of:
+
+Fusion HCM workforce extraction
+LMS integration reporting
+Employee demographic synchronization
+Effective-dated HR reporting
+
+It provides a strong reusable foundation for Oracle Fusion HCM outbound integrations and workforce reporting solutions.
