@@ -1,0 +1,111 @@
+Business Problem
+
+In Oracle Fusion PPM, project and task details live across multiple tables. Reporting on A client a project becomes a little hard to connect via SQL because the client relationship is not stored directly on the project — it is resolved through the billing contract chain:
+Project → Contract Project Link → Contract Line → Billing Plan → Customer Account → Party (Client Name)
+
+This query solves both problems in a single, reusable SQL that also supports dynamic filtering by project name or a last-update date range — making it suitable for scheduled BIP reports and on-demand extracts.
+
+Parameters
+
+Parameter:P_PROJECT_NAMEVARCHAR2 is the project name. When supplied, date range is ignored.:P_START_DATEVARCHAR2 (YYYY-MM-DD) last-update date window for projects or tasks.:P_END_DATEVARCHAR2 (YYYY-MM-DD) last-update date window for projects or tasks.
+
+Note: At least one parameter must be supplied. If both P_PROJECT_NAME and the date range are NULL, the query returns no rows (by design, to prevent unbounded full-table scans in production).
+
+SELECT 
+    proj.segment1                          AS project_number,
+    proj_tl.name                           AS project_name,
+    proj.project_status_code               AS project_status,
+    projt.enable_billing_flag              AS billable_flag,
+    TRIM(proj.start_date)                  AS start_date,
+    TRIM(proj.completion_date)             AS end_date,
+    hou.name                               AS client,
+    proj.attribute1                        AS division,
+    proj.attribute2                        AS product,
+    task_tl.name                           AS task_name,
+    task.element_number                    AS task_number,
+    TRIM(task.start_date)                  AS task_start_date,
+    TRIM(task.completion_date)             AS task_end_date,
+    task.billable_flag                     AS task_billable_status,
+    hou.name                               AS business_unit,
+    (SELECT haotl.name
+       FROM hr_organization_units_f_tl haotl
+      WHERE haotl.organization_id = proj.project_unit_id
+        AND haotl.language        = USERENV('LANG')
+        AND ROWNUM = 1)                    AS project_unit
+FROM
+    pjf_projects_all_b      proj,
+    pjf_project_types_b     projt,
+    pjf_projects_all_tl     proj_tl,
+    pjf_proj_elements_b     task,
+    pjf_proj_elements_tl    task_tl,
+    hr_operating_units      hou,
+    (SELECT
+         cpl.project_id,
+         kl.bill_plan_id,
+         kl.major_version,
+         ROW_NUMBER() OVER (
+             PARTITION BY cpl.project_id
+             ORDER BY kh.start_date DESC, cpl.contract_id DESC
+         ) AS rn
+     FROM
+         pjb_cntrct_proj_links cpl,
+         pjb_bill_plans_b      bp,
+         okc_k_headers_all_b   kh,
+         okc_k_lines_b         kl
+     WHERE cpl.active_flag    = 'Y'
+       AND kh.id              = cpl.contract_id
+       AND kh.major_version   = cpl.major_version
+       AND kh.template_yn     = 'N'
+       AND kl.id              = cpl.contract_line_id
+       AND kl.major_version   = cpl.major_version
+       AND kl.version_type   IN ('A','C')
+       AND kl.sts_code       IN ('ACTIVE','EXPIRED','HOLD','CLOSED')
+       AND bp.bill_plan_id    = kl.bill_plan_id
+       AND bp.major_version   = kl.major_version
+    )                       cpl_ranked,
+    pjb_bill_plans_b        bp,
+    hz_cust_accounts        hca,
+    hz_parties              hp
+WHERE
+
+        proj.project_type_id      = projt.project_type_id
+    AND proj.project_id           = proj_tl.project_id
+    AND proj_tl.language          = USERENV('LANG')
+    AND proj.org_id               = hou.organization_id
+    AND task.project_id           = proj.project_id
+    AND task.element_type         = 'FINANCIAL'
+    AND task.object_type          = 'PJF_TASKS'
+    AND task.project_id           = task_tl.project_id
+    AND task.proj_element_id      = task_tl.proj_element_id
+    AND task_tl.language          = USERENV('LANG')
+
+    AND cpl_ranked.project_id  = proj.project_id(+)
+    AND cpl_ranked.rn          = 1
+    AND bp.bill_plan_id        = cpl_ranked.bill_plan_id(+)
+    AND bp.major_version       = cpl_ranked.major_version(+)
+    AND hca.cust_account_id    = bp.bill_to_cust_acct_id(+)
+    AND hp.party_id            = hca.party_id(+)
+    AND hou.name IN ('BU1','BU2')
+    AND proj.clin_linked_code IS NOT NULL
+    AND (
+            (:P_PROJECT_NAME IS NOT NULL AND proj_tl.name = :P_PROJECT_NAME)
+         OR (:P_START_DATE   IS NOT NULL AND :P_END_DATE IS NOT NULL
+             AND (   proj.last_update_date BETWEEN TO_DATE(:P_START_DATE,'YYYY-MM-DD')
+                                               AND TO_DATE(:P_END_DATE,  'YYYY-MM-DD')
+                  OR task.last_update_date BETWEEN TO_DATE(:P_START_DATE,'YYYY-MM-DD')
+                                               AND TO_DATE(:P_END_DATE,  'YYYY-MM-DD'))));
+
+
+Important tables:
+
+PJF_PROJECTS_ALL_B → Project header
+PJF_PROJ_ELEMENTS_B → Tasks/WBS
+PJB_CNTRCT_PROJ_LINKS → Project-contract relationship
+OKC_K_HEADERS_ALL_B → Contract headers
+OKC_K_LINES_B → Contract lines
+PJB_BILL_PLANS_B → Billing plans
+HZ_CUST_ACCOUNTS → Customer accounts
+HZ_PARTIES → Customer names
+
+In Fusion PPM, the client-to-project relationship is indirect — always resolved through the contract billing chain, not a direct FK on the project table.
+The _TL (translation) tables in Fusion always require a language filter — omitting it produces one row per installed language.
