@@ -1,0 +1,228 @@
+Business Problem
+Many organizations use a third-party time tracking or project management tool (e.g. Primavera, or a bespoke timesheet app) alongside Oracle Fusion PPM. Project costs recorded in the external system need to flow into Fusion PPM so that:
+
+Project managers see accurate cost actuals in real time
+Billing and invoicing is based on approved, imported time entries
+Project performance dashboards reflect up-to-date KPIs
+
+Oracle Fusion does not natively connect to arbitrary external systems — this integration pattern demonstrates the standard Oracle-recommended approach using the Unprocessed Project Costs REST API + ESS job orchestration, which is the safest and most supportable method for bulk cost ingestion.
+
+## The 7-Step Pattern
+
+| Step | Method | API / Job | Purpose |
+|------|--------|-----------|---------|
+| 1 | REST POST | `unprocessedProjectCosts` | Upload each transaction to Fusion staging |
+| 2 | REST POST | `erpintegrations` (ESS submit) | Trigger the Import Project Costs ESS job |
+| 3 | REST GET | `erpintegrations` (ESS status) | Poll until import job completes |
+| 4 | REST GET | `erpintegrations` (ESS logs) | Download output/log files for error handling |
+| 5 | REST POST | `erpintegrations` (ESS submit) | Trigger Update Project Performance Data job |
+| 6 | REST GET | `erpintegrations` (ESS status) | Poll until performance job completes |
+
+## Postman Collection Setup
+
+### 1. Import the Collection
+1. Open Postman → **Import** → drag in `INTE-PPM-CostImport.postman_collection.json`
+
+### 2. Create an Environment
+Create a Postman Environment and set these variables:
+
+| Variable | Example Value | Notes |
+|----------|--------------|-------|
+| `fusion_base_url` | `https://[instance].fa.ocs.oraclecloud.com` | Your Fusion Cloud hostname |
+| `fusion_username` | `svc_integration_user` | Service account — not a personal login |
+| `fusion_password` | *(set as secret)* | Store as Postman Secret, never in plain text |
+| `business_unit_name` | `[Your BU Name]` | As configured in Fusion |
+| `transaction_source` | `[Your Source Name]` | Configured in PPM Setup |
+| `transaction_source_id` | `[ID from Fusion]` | Internal Fusion ID |
+| `project_unit_id` | `[ID from Fusion]` | Internal org ID for project unit |
+| `expenditure_batch_name` | `MYSOURCE_20250131_001` | Unique per run |
+| `project_number` | `[Project Number]` | From `PJF_PROJECTS_ALL_B.segment1` |
+| `task_number` | `[Task Number]` | Task within the project |
+| `expenditure_type` | `Std Time` | Must exist in Fusion PPM |
+| `ess_request_id` | *(populated after Step 3)* | From Step 3 response |
+| `ess_performance_request_id` | *(populated after Step 6)* | From Step 6 response |
+
+> ⚠️ **Never store passwords in the collection itself.** Always use Postman Environment Secrets or an external vault (e.g. Azure Key Vault, HashiCorp Vault) in production.
+
+### 3. Run Steps in Order
+Execute requests sequentially: Step 1 → 2 → 3 → (poll 4) → 5 (if needed) → 6 → (poll 7)
+
+---
+
+## Step-by-Step Guide
+
+### Step 1 — Upload Unprocessed Project Cost
+
+**Endpoint:** `POST /fscmRestApi/resources/latest/unprocessedProjectCosts`
+
+**Critical fields:**
+
+```json
+{
+  "ExpenditureBatch": "MYSOURCE_20250131_001",
+  "OriginalTransactionReference": "UNIQUE_SOURCE_ID_123",
+  "ProjectStandardCostCollectionFlexfields": [{
+    "_PROJECT_ID_Display": "PROJ-001",
+    "_TASK_ID_Display": "TASK 01",
+    "_EXPENDITURE_TYPE_ID_Display": "Std Time",
+    "_BILLABLE_FLAG": "Y"
+  }]
+}
+```
+
+**Important:**
+- `ExpenditureBatch` groups your transactions — use a consistent, unique name per run
+- `OriginalTransactionReference` is your **duplicate prevention key** — Fusion rejects transactions with a reference that has already been successfully imported
+- `_PROJECT_ID_Display` uses the project **number** (segment1), not the internal project_id
+- In OIC, this call goes inside a **For Each** action iterating over the decoded source rows
+
+---
+
+### Step 2 — Submit Import Project Costs ESS Job
+
+After all cost rows are staged, submit the import job:
+
+**Endpoint:** `POST /fscmRestApi/resources/11.13.18.05/erpintegrations`
+
+```json
+{
+  "OperationName": "submitESSJobRequest",
+  "JobPackageName": "/oracle/apps/ess/projects/costing/transactions/onestop/",
+  "JobDefName": "ImportProcessParallelEssJob",
+  "ESSParameters": "[BU],[SOURCE_ID],IMPORT_AND_PROCESS,PREV_NOT_IMPORTED,,[BATCH_SOURCE_ID],,,,,,,,ORA_PJC_SUMMARY,Y"
+}
+```
+
+**ESSParameters position map:**
+
+| Position | Value | Notes |
+|----------|-------|-------|
+| 1 | Business Unit name | Must match exactly |
+| 2 | Transaction Source ID | Internal Fusion numeric ID |
+| 3 | `IMPORT_AND_PROCESS` | Imports and validates in one pass |
+| 4 | `PREV_NOT_IMPORTED` | Skips already-imported transactions |
+| 5 | *(blank)* | |
+| 6 | Batch Source System ID | Environment-specific |
+| 7–13 | *(blank)* | Leave empty for defaults |
+| 14 | `ORA_PJC_SUMMARY` | Summary level |
+| 15 | `Y` | Enable summarization |
+
+The response body contains `ReqstId` — save this as `ess_request_id` for Step 4.
+
+---
+
+### Step 3 — Poll ESS Job Status
+
+**Endpoint:** `GET /fscmRestApi/resources/11.13.18.05/erpintegrations?finder=ESSJobStatusRF;requestId={{ess_request_id}}`
+
+Poll on a timed interval (recommended: every 30 seconds). Exit when `RequestStatus` returns:
+
+| Status | Meaning | Action |
+|--------|---------|--------|
+| `WAIT` | Queued | Keep polling |
+| `RUNNING` | In progress | Keep polling |
+| `SUCCEEDED` | Complete | Proceed to Step 6 |
+| `WARNING` | Completed with warnings | Check logs (Step 5), may still proceed |
+| `ERROR` | Failed | Download logs (Step 5), investigate and retry |
+
+In OIC, implement this as a **While loop** with a **Wait** action and a counter to avoid infinite loops.
+
+---
+
+### Step 4 — Download ESS Job Logs
+
+**Endpoint:** `GET /fscmRestApi/resources/latest/erpintegrations?finder=ESSJobExecutionDetailsRF;requestId={{ess_request_id}},fileType=ALL`
+
+Returns Base64-encoded log and output files. Decode and parse to:
+- Count records imported vs rejected
+- Identify specific rows that failed validation (wrong project, task, or expenditure type)
+- Store as integration audit evidence
+
+Common errors found in logs:
+- `Project not found` — project number doesn't exist or wrong BU scope
+- `Task not chargeable` — task has `FINANCIAL_TASK = N`
+- `Expenditure type not valid` — type not configured for the transaction source
+- `Person not found` — person number doesn't match an active employee
+
+---
+
+### Step 5 — Update Project Performance Data
+
+**Endpoint:** `POST /fscmRestApi/resources/latest/erpintegrations`
+
+```json
+{
+  "OperationName": "submitESSJobRequest",
+  "JobPackageName": "/oracle/apps/ess/projects/performanceReporting/trackAndManage",
+  "JobDefName": "PjsSumMainJobDef",
+  "ESSParameters": "INCREMENTAL,,{{project_unit_id}},,,Y,Y,Y,,,Y,N"
+}
+```
+
+This step is **mandatory** — without it, project managers see stale actuals in their dashboards even after a successful cost import. The job recalculates:
+- Cost actuals vs budget
+- Revenue recognition
+- Project KPIs and health indicators
+- Forecast updates
+
+Use `INCREMENTAL` mode for regular runs (faster). Use `FULL` only for initial loads or after data corrections.
+
+---
+
+### Step 6 — Poll Performance Job Status
+
+Same pattern as Step 4, using `ess_performance_request_id` from Step 6's response.
+
+---
+
+## OIC Implementation Notes
+
+When implementing this pattern in **Oracle Integration Cloud**:
+
+1. Use a **REST Adapter** connection to your Fusion instance with Basic Auth (or OAuth for production)
+2. Use a **SOAP Adapter** connection for the BIP `ExternalReportWSSService` call
+3. Place Step 2 inside a **For Each** action to loop over source transactions
+4. Implement Step 4 and 7 as a **While** loop + **Wait** (30s) + **counter** (max 20 iterations) to prevent infinite polling
+5. Use **Fault Handling** on Steps 2, 3, and 6 — write failures to an error table or notification
+6. Store the `OriginalTransactionReference` in a tracking field to enable safe resubmission
+7. Use **Structured Logger** to record request IDs, batch names, and record counts for operational monitoring
+
+---
+
+## Security Best Practices
+
+- Use a **dedicated service account** (not a personal user) with only the required PPM Integration roles
+- Assign the service account: `Project Integration Specialist` + `Project Manager` roles (minimum)
+- Rotate the service account password regularly and update your OIC connection credentials
+- In production, use **OAuth 2.0** instead of Basic Auth where Fusion version supports it
+- Never log full request/response bodies in OIC — they may contain person numbers and financial data
+
+---
+
+## Notes & Gotchas
+
+- **`PREV_NOT_IMPORTED` parameter** is critical — without it, the ESS job re-imports all transactions in the source, causing duplicates
+- **Batch naming** — use a timestamp or run ID in the batch name to make each run uniquely identifiable in Fusion's cost import history
+- **Project unit ID** in Step 6 is the **organization_id** of the project unit (not the BU ID) — these are different and easy to confuse
+- **BIP response decoding** — the `runReport` SOAP response returns data as Base64 inside `<reportBytes>`. You must Base64-decode → XML parse → iterate rows in your OIC mapper
+- **ESS job API version** — Steps 3, 4, and 7 use the versioned endpoint (`11.13.18.05`). Verify this version is available on your Fusion instance; newer instances may require updating to a later version string
+
+---
+
+## What I Learned
+
+- The **Unprocessed Project Costs REST API** is the Oracle-recommended replacement for FBDI file uploads for smaller, real-time integrations — it eliminates the need to generate, zip, and upload CSV files via UCM
+- **`OriginalTransactionReference`** is Fusion's built-in idempotency key for cost imports — always populate it with a unique source system ID to make the integration safely re-runnable
+- The **Update Project Performance Data** step is non-obvious but essential — cost imports alone do not refresh project dashboards; a separate summarization job must be triggered
+- **ESS job status polling** is a common pattern across all Fusion ESS-based integrations (AP invoice import, GL journal import, etc.) — mastering it once makes all other Fusion integration flows easier
+- **BIP SOAP responses are Base64** — many developers are surprised by this; building a reusable Base64-decode function in OIC early saves significant rework
+
+
+## Related Oracle Documentation
+
+- [Oracle Fusion PPM REST API – Unprocessed Project Costs](https://docs.oracle.com/en/cloud/saas/project-management/rest-api/op-unprocessedprojectcosts-post.html)
+- [Oracle ERP Integrations REST API – ESS Job Submission](https://docs.oracle.com/en/cloud/saas/financials/rest-api/op-erpintegrations-post.html)
+- [BI Publisher SOAP Web Services Guide](https://docs.oracle.com/en/middleware/bi-publisher/12.2.1.4/bipws/)
+- [Oracle PPM Cost Import Overview](https://docs.oracle.com/en/cloud/saas/project-management/project-costing-implement.html)
+
+
